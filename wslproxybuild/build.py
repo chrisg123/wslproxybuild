@@ -5,7 +5,7 @@ import os
 import subprocess
 import argparse
 import xml.etree.ElementTree as ET
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from signal import signal, SIGINT
 
 def sigint(
@@ -38,6 +38,11 @@ def main():
 
     output = get_build_output(project_file)
 
+    if args.run:
+        exe_path = find_executable(Path(output.as_posix()), project_file)
+        run_executable(exe_path, args.run_args)
+        return 0
+
     CC = None
     CFLAGS = ""
 
@@ -60,10 +65,7 @@ def main():
                 f"/p:Platform=\"{args.platform}\"",
                 f"/p:WarningLevel=\"{args.warn}\"",
                 f"/p:VSToolsPath='{vstools}'" if vstools != None else "",
-                f"/p:OutputPath=\"{output}\"",
-                "2>&1",
-                "|",
-                "tee"
+                f"/p:OutputPath=\"{output}\""
             ]
         )
     else:
@@ -105,14 +107,13 @@ def main():
         stderr=subprocess.STDOUT,
         shell=True,
         encoding='utf-8',
-        errors='replace'
-    )
+        errors='replace')
 
-    lines = []
-    formatted_lines = []
-    line = ""
-    state = 0
+    process_output(p)
 
+    return 0
+
+def process_output(p: subprocess.Popen):
     while True:
         output = p.stdout.readline()
 
@@ -121,11 +122,8 @@ def main():
 
         sys.stdout.flush()
         line = output.rstrip()
-        lines.append(line)
-        formatted = line
-        stripped = formatted.strip()
 
-        m = re.search(r'(?P<full_path>[A-Z]:\\[^\s\(:]*)(?:\((?P<line>\d+),(?P<col>\d+)\))?:\s*(?P<message>.*)', formatted)
+        m = re.search(r'(?P<full_path>[A-Z]:\\[^\s\(:]*)(?:\((?P<line>\d+),(?P<col>\d+)\))?:\s*(?P<message>.*)', line)
 
         if m and len(m.groups()) == 4:
             full_path =  m.group('full_path')
@@ -145,8 +143,26 @@ def main():
             print(f"{wsl_parsed}: {msg}")
             continue
 
-        print(output)
-    return 0
+        print(format_message(output), end='')
+
+def format_message(msg: str) -> str:
+    if "Build succeeded." in msg:
+        msg = msg.replace("Build succeeded.", f"{C('green')}Build succeeded.{C('endc')}")
+    if "Warning(s)" in msg:
+        msg = msg.replace("Warning(s)", f"{C('yellow')}Warning(s){C('endc')}")
+    if "Error(s)" in msg:
+        msg = msg.replace("Error(s)", f"{C('boldred')}Error(s){C('endc')}")
+
+    formatted_msg = re.sub(r'\berror\b', f"{C('boldred')}error{C('endc')}", msg, flags=re.IGNORECASE)
+    windows_path_pattern = re.compile(r'([A-Z]:\\[^\s\):]+)')
+
+    def replace_with_wsl(match):
+        win_path = match.group(1)
+        return windows_to_wsl(win_path)
+
+    formatted_msg = windows_path_pattern.sub(replace_with_wsl, formatted_msg)
+    return formatted_msg
+
 
 def find_project_file() -> Path:
     for p in list(Path('.').glob('*')):
@@ -178,6 +194,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--config", default="Debug", help="Build configuration")
     parser.add_argument("--platform", default="AnyCPU", help="Target platform")
     parser.add_argument("--warn", default="2", help="Warning level")
+    parser.add_argument("-r", "--run", action="store_true", help="Run")
+    parser.add_argument("--run-args", nargs=argparse.REMAINDER, help="Run arguments")
     return parser.parse_args()
 
 def get_warnignore(project_file: Path) -> list:
@@ -191,14 +209,14 @@ def get_warnignore(project_file: Path) -> list:
                     warnings.append(stripped)
     return warnings
 
-def get_build_output(project_file: Path, default_output: str = r"bin\Debug") -> str:
+def get_build_output(project_file: Path, default_output: str = r"bin\Debug") -> PureWindowsPath:
     buildoutput_file = project_file.parent / ".buildoutput"
     if buildoutput_file.exists():
         with buildoutput_file.open() as f:
             content = f.read().strip()
             if content:
-                return content
-    return default_output
+                return PureWindowsPath(content)
+    return PureWindowsPath(default_output)
 
 def windows_to_wsl(win_path: str) -> str:
     drive, path = win_path.split(':', 1)
@@ -206,16 +224,40 @@ def windows_to_wsl(win_path: str) -> str:
     path = path.replace('\\', '/').lstrip('/')
     return f"/mnt/{drive}/{path}"
 
-def format_message(msg: str) -> str:
-    formatted_msg = re.sub(r'\berror\b', f"{C('boldred')}error{C('endc')}", msg, flags=re.IGNORECASE)
-    windows_path_pattern = re.compile(r'([A-Z]:\\[^\s\):]+)')
+def run_executable(exe_path: str, args: [str]):
+    if not exe_path:
+        print("Executable not found.")
+        sys.exit(1)
 
-    def replace_with_wsl(match):
-        win_path = match.group(1)
-        return windows_to_wsl(win_path)
+    try:
+        cmd = [exe_path] + (args if args else [])
+        p = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            shell=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        while True:
+            output = p.stdout.readline()
+            if output == '' and p.poll() is not None:
+                break
+            print(output, end='')
 
-    formatted_msg = windows_path_pattern.sub(replace_with_wsl, formatted_msg)
-    return formatted_msg
+    except subprocess.CalledProcessError as e:
+        print(f"Execution failed with return code {e.returncode}")
+    except KeyboardInterrupt:
+        print("Execution interrupted.")
+
+
+def find_executable(search_path: Path, project: Path) -> Path:
+    exe = search_path.glob(f"{project.stem}.exe")
+    result = next(exe, None)
+    if result and result.is_file():
+        return result
+    else:
+        return None
 
 def C(k: str) -> str:
 
