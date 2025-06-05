@@ -125,22 +125,24 @@ def main():
         formatted = line
         stripped = formatted.strip()
 
-        m = re.search(r'( +at.*in )(C:\\[^:]+):line ([0-9]+)', formatted)
+        m = re.search(r'(?P<full_path>[A-Z]:\\[^\s\(:]*)(?:\((?P<line>\d+),(?P<col>\d+)\))?:\s*(?P<message>.*)', formatted)
 
-        if m and len(m.groups()) == 3:
-            begin = m.groups()[0]
-            filename = m.groups()[1]
-            linenum = int(m.groups()[2])
-            d, z = filename.split(':')
-            filename = '/mnt/' + d.lower() + z.replace('\\', '/')
-            compmodepath = f"{filename}:{linenum}:"
+        if m and len(m.groups()) == 4:
+            full_path =  m.group('full_path')
+            line_num = m.group('line')
+            col_num = m.group('col')
+            msg = format_message(m.group('message'))
 
-            formatted_lines.append(begin)
-            formatted_lines.append(filename)
-            print(begin)
-            print(compmodepath)
+            wsl_path = windows_to_wsl(full_path)
 
-            line = ""
+            if line_num and col_num:
+                wsl_parsed = f"{wsl_path}:{line_num}:{col_num}"
+            elif line_num:
+                wsl_parsed = f"{wsl_path}:{line_num}"
+            else:
+                wsl_parsed = wsl_path
+
+            print(f"{wsl_parsed}: {msg}")
             continue
 
         print(output)
@@ -198,11 +200,29 @@ def get_build_output(project_file: Path, default_output: str = r"bin\Debug") -> 
                 return content
     return default_output
 
+def windows_to_wsl(win_path: str) -> str:
+    drive, path = win_path.split(':', 1)
+    drive = drive.lower()
+    path = path.replace('\\', '/').lstrip('/')
+    return f"/mnt/{drive}/{path}"
+
+def format_message(msg: str) -> str:
+    formatted_msg = re.sub(r'\berror\b', f"{C('boldred')}error{C('endc')}", msg, flags=re.IGNORECASE)
+    windows_path_pattern = re.compile(r'([A-Z]:\\[^\s\):]+)')
+
+    def replace_with_wsl(match):
+        win_path = match.group(1)
+        return windows_to_wsl(win_path)
+
+    formatted_msg = windows_path_pattern.sub(replace_with_wsl, formatted_msg)
+    return formatted_msg
+
 def C(k: str) -> str:
 
     control_codes = {
         'endc': '\033[m',
         'red': '\033[31m',
+        'boldred': '\033[1;31m',
         'green': '\033[32m',
         'yellow': '\033[33m',
         'blue': '\033[34m',
