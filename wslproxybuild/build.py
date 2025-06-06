@@ -123,7 +123,16 @@ def process_output(p: subprocess.Popen):
         sys.stdout.flush()
         line = output.rstrip()
 
-        m = re.search(r'(?P<full_path>[A-Z]:\\[^\s\(:]*)(?:\((?P<line>\d+),(?P<col>\d+)\))?:\s*(?P<message>.*)', line)
+        pattern = r'''
+          (?P<full_path>                      # start capturing the path
+              [A-Za-z]:\\                     #   drive letter + “:\”
+              [^:(]+                          #   one or more chars that are NOT “:” or “(”
+          )
+          (?:\((?P<line>\d+),(?P<col>\d+)\))? # optional “(line,col)”
+          :\s*                                # then a “:” and any spaces
+          (?P<message>.*)                     # finally, the rest of the error message
+        '''
+        m = re.search(pattern, line, re.VERBOSE)
 
         if m and len(m.groups()) == 4:
             full_path =  m.group('full_path')
@@ -131,7 +140,7 @@ def process_output(p: subprocess.Popen):
             col_num = m.group('col')
             msg = format_message(m.group('message'))
 
-            wsl_path = windows_to_wsl(full_path)
+            wsl_path = windows_to_wsl(PureWindowsPath(full_path)).resolve()
 
             if line_num and col_num:
                 wsl_parsed = f"{wsl_path}:{line_num}:{col_num}"
@@ -156,9 +165,9 @@ def format_message(msg: str) -> str:
     formatted_msg = re.sub(r'\berror\b', f"{C('boldred')}error{C('endc')}", msg, flags=re.IGNORECASE)
     windows_path_pattern = re.compile(r'([A-Z]:\\[^\s\):]+)')
 
-    def replace_with_wsl(match):
+    def replace_with_wsl(match) -> str:
         win_path = match.group(1)
-        return windows_to_wsl(win_path)
+        return str(windows_to_wsl(PureWindowsPath(win_path)).resolve())
 
     formatted_msg = windows_path_pattern.sub(replace_with_wsl, formatted_msg)
     return formatted_msg
@@ -218,11 +227,11 @@ def get_build_output(project_file: Path, default_output: str = r"bin\Debug") -> 
                 return PureWindowsPath(content)
     return PureWindowsPath(default_output)
 
-def windows_to_wsl(win_path: str) -> str:
-    drive, path = win_path.split(':', 1)
-    drive = drive.lower()
-    path = path.replace('\\', '/').lstrip('/')
-    return f"/mnt/{drive}/{path}"
+def windows_to_wsl(win_path: PureWindowsPath) -> Path:
+    drive = win_path.drive.rstrip(':').lower()
+    remainder = win_path.relative_to(win_path.anchor)
+    posix_remainder = remainder.as_posix()
+    return Path(f"/mnt/{drive}/{posix_remainder}")
 
 def run_executable(exe_path: str, args: [str]):
     if not exe_path:
