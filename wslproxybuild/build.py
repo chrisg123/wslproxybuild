@@ -65,7 +65,7 @@ def main():
                 f"/p:Platform=\"{args.platform}\"",
                 f"/p:WarningLevel=\"{args.warn}\"",
                 f"/p:VSToolsPath='{vstools}'" if vstools != None else "",
-                f"/p:OutputPath=\"{output}\""
+                f"/p:OutputPath='{output}'"
             ]
         )
     else:
@@ -81,7 +81,7 @@ def main():
                 f"/p:Platform=\"{args.platform}\"",
                 f"/p:WarningLevel=\"{args.warn}\"",
                 f"/p:VSToolsPath='{vstools}'" if vstools != None else "",
-                f"/p:OutputPath=\"{output}\"",
+                f"/p:OutputPath='{output}'",
                 "2>&1",
                 "|",
                 "tee"
