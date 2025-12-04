@@ -39,8 +39,10 @@ def main():
     output = get_build_output(project_file)
 
     if args.run:
+        run_args_from_file = get_run_args(project_file)
+        run_args = args.run_args if args.run_args else run_args_from_file
         exe_path = find_executable(Path(output.as_posix()), project_file)
-        run_executable(exe_path, args.run_args)
+        run_executable(exe_path, run_args)
         return 0
 
     CC = None
@@ -222,10 +224,24 @@ def get_build_output(project_file: Path, default_output: str = r"bin\Debug") -> 
     buildoutput_file = project_file.parent / ".buildoutput"
     if buildoutput_file.exists():
         with buildoutput_file.open() as f:
-            content = f.read().strip()
-            if content:
-                return PureWindowsPath(content)
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    return PureWindowsPath(stripped)
     return PureWindowsPath(default_output)
+
+def get_run_args(project_file: Path) -> list:
+    runargs_file = project_file.parent / ".runargs"
+    run_args = []
+
+    if runargs_file.exists():
+        with runargs_file.open() as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    run_args.extend(stripped.split())
+
+    return run_args
 
 def windows_to_wsl(win_path: PureWindowsPath) -> Path:
     drive = win_path.drive.rstrip(':').lower()
@@ -244,7 +260,7 @@ def run_executable(exe_path: str, args: [str]):
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            shell=True,
+            shell=False,
             encoding='utf-8',
             errors='replace'
         )
