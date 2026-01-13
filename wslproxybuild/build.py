@@ -52,7 +52,7 @@ def main():
 
     vstools = os.getenv('VSTOOLSPATH')
 
-    if framework_ver == 'net6.0':
+    if framework_ver == 'net6.0' or framework_ver == 'net8.0':
         cc_hint = "Ensure environment variable DOTNET is set in WSL."
         CC = os.getenv('DOTNET')
         CFLAGS =  str.join(
