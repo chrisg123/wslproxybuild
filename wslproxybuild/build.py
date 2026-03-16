@@ -52,7 +52,9 @@ def main():
 
     vstools = os.getenv('VSTOOLSPATH')
 
-    if framework_ver == 'net6.0' or framework_ver == 'net8.0':
+    uses_com = project_uses_com(project_file)
+
+    if framework_ver == 'net6.0' or framework_ver == 'net8.0' and not uses_com:
         cc_hint = "Ensure environment variable DOTNET is set in WSL."
         CC = os.getenv('DOTNET')
         CFLAGS =  str.join(
@@ -296,6 +298,15 @@ def C(k: str) -> str:
         'cyan': '\033[36m'
     }
     return control_codes[k]
+
+def project_uses_com(project_file: Path) -> bool:
+    tree = ET.parse(project_file.resolve())
+    root = tree.getroot()
+
+    if root.find(".//COMReference") is not None:
+        return True
+
+    return False
 
 if __name__ == "__main__":
     sys.exit(main())
