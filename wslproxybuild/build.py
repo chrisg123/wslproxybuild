@@ -1,5 +1,6 @@
 #!/usr/bin/python
 import sys
+import stat
 import re
 import os
 import subprocess
@@ -7,6 +8,11 @@ import argparse
 import xml.etree.ElementTree as ET
 from pathlib import Path, PureWindowsPath
 from signal import signal, SIGINT
+
+DEFAULT_DOTNET = "/mnt/c/Program Files/dotnet/dotnet.exe"
+WINDOWS_BUILD_ROOT = os.getenv("WSL_PROXY_BUILD_ROOT", "C:/Temp/wslproxybuild")
+NO_INCREMENTAL_BUILD = False
+GENERATE_WARNIGNORE = False
 
 def sigint(
     _signum,
@@ -41,56 +47,80 @@ def main():
     if args.run:
         run_args_from_file = get_run_args(project_file)
         run_args = args.run_args if args.run_args else run_args_from_file
-        exe_path = find_executable(Path(output.as_posix()), project_file)
+        run_output = get_run_output_path(project_file, output, args.config, args.platform, framework_ver)
+        exe_path = find_executable(run_output, project_file)
         run_executable(exe_path, run_args)
         return 0
 
     CC = None
-    CFLAGS = ""
+    cmd = []
 
     cc_hint = ""
 
     vstools = os.getenv('VSTOOLSPATH')
 
     uses_com = project_uses_com(project_file)
+    obj_path, bin_path = get_windows_build_paths()
+    build_props_path = write_windows_build_props(obj_path, bin_path)
+    build_targets_path = write_windows_build_targets()
+
+    print(f"********** Project references COM assemblies **********")
+
+    pathmap = get_pathmap(project_file)
 
     if framework_ver == 'net6.0' or framework_ver == 'net8.0' and not uses_com:
         cc_hint = "Ensure environment variable DOTNET is set in WSL."
-        CC = os.getenv('DOTNET')
-        CFLAGS =  str.join(
-            ' ',
-            [
+        CC = get_command_path('DOTNET', DEFAULT_DOTNET)
+        cmd = [
+                CC,
                 "build",
-                f"'{project_file.name}'",
-                f"--verbosity \"{args.verbosity}\"",
-                f"--configuration \"{args.config}\"",
-                f"--framework \"{framework_ver}\"",
-                nowarn,
-                f"/p:Platform=\"{args.platform}\"",
-                f"/p:WarningLevel=\"{args.warn}\"",
-                f"/p:VSToolsPath='{vstools}'" if vstools != None else "",
-                f"/p:OutputPath='{output}'"
+                project_file.name,
+                "--verbosity",
+                args.verbosity,
+                "--configuration",
+                args.config,
+                "--framework",
+                framework_ver,
+                f"-p:Platform={args.platform}",
+                f"-p:WarningLevel={args.warn}",
+                f"-p:DirectoryBuildPropsPath={build_props_path}",
+                f"-p:CustomBeforeMicrosoftCommonTargets={build_targets_path}",
             ]
-        )
+
+        if NO_INCREMENTAL_BUILD:
+            cmd.append("--no-incremental")
+        if nowarn and not GENERATE_WARNIGNORE:
+            cmd.append(nowarn)
+        if output:
+            cmd.append(f"-p:OutputPath={format_windows_output_path(output)}")
+        if vstools != None:
+            cmd.append(f"-p:VSToolsPath={vstools}")
+        if pathmap:
+            cmd.append(f"-p:{pathmap}")
     else:
         cc_hint = "Ensure environment variable MSBUILD is set in WSL."
-        CC = os.getenv('MSBUILD')
-        CFLAGS = str.join(
-            ' ',
-            [
-                nowarn,
-                f"'{project_file.name}'",
-                f"/verbosity:\"{args.verbosity}\"",
-                f"/p:Configuration=\"{args.config}\"",
-                f"/p:Platform=\"{args.platform}\"",
-                f"/p:WarningLevel=\"{args.warn}\"",
-                f"/p:VSToolsPath='{vstools}'" if vstools != None else "",
-                f"/p:OutputPath='{output}'",
-                "2>&1",
-                "|",
-                "tee"
+        CC = get_command_path('MSBUILD')
+        cmd = [
+                CC,
+                project_file.name,
+                f"/verbosity:{args.verbosity}",
+                f"/p:Configuration={args.config}",
+                f"/p:Platform={args.platform}",
+                f"/p:WarningLevel={args.warn}",
+                f"/p:DirectoryBuildPropsPath={build_props_path}",
+                f"/p:CustomBeforeMicrosoftCommonTargets={build_targets_path}",
             ]
-        )
+
+        if NO_INCREMENTAL_BUILD:
+            cmd.append("/t:Rebuild")
+        if nowarn and not GENERATE_WARNIGNORE:
+            cmd.append(nowarn)
+        if output:
+            cmd.append(f"/p:OutputPath={format_windows_output_path(output)}")
+        if vstools != None:
+            cmd.append(f"/p:VSToolsPath={vstools}")
+        if pathmap:
+            cmd.append(f"/p:{pathmap}")
 
     if CC is None:
         sys.stderr.write(f"No compiler command.\n{cc_hint}.\n")
@@ -101,23 +131,36 @@ def main():
 
     print(msg)
 
-    cmd = f"'{CC}' {CFLAGS}"
+    working_directory = project_file.parent
 
-    print(cmd)
+    print(subprocess.list2cmdline(cmd))
 
     p = subprocess.Popen(
         cmd,
+        cwd=working_directory,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        shell=True,
+        shell=False,
         encoding='utf-8',
         errors='replace')
 
-    process_output(p)
+    warning_codes = set()
+    process_output(p, warning_codes if GENERATE_WARNIGNORE else None)
 
-    return 0
+    if GENERATE_WARNIGNORE:
+        write_warnignore(project_file, warning_codes)
 
-def process_output(p: subprocess.Popen):
+    return p.returncode
+
+def wsl_unc_to_wsl_path(p: str) -> str:
+    prefix_re = re.compile(r'^\\\\(wsl\.localhost|wsl\$)\\[^\\]+\\', re.IGNORECASE)
+    if prefix_re.match(p):
+        rest = prefix_re.sub('', p)          # strip \\wsl.localhost\<distro>\
+        rest = rest.replace('\\', '/')       # backslashes -> slashes
+        return '/' + rest.lstrip('/')
+    return p
+
+def process_output(p: subprocess.Popen, warning_codes: set = None):
     while True:
         output = p.stdout.readline()
 
@@ -126,25 +169,29 @@ def process_output(p: subprocess.Popen):
 
         sys.stdout.flush()
         line = output.rstrip()
+        collect_warning_code(line, warning_codes)
 
         pattern = r'''
-          (?P<full_path>                      # start capturing the path
-              [A-Za-z]:\\                     #   drive letter + “:\”
-              [^:(]+                          #   one or more chars that are NOT “:” or “(”
+          (?P<full_path>
+              (?:[A-Za-z]:\\[^:(]+)                 # C:\...
+            | (?:\\\\(?:wsl\.localhost|wsl\$)\\[^\\]+\\[^:(]+)  # \\wsl.localhost\<distro>\...
           )
-          (?:\((?P<line>\d+),(?P<col>\d+)\))? # optional “(line,col)”
-          :\s*                                # then a “:” and any spaces
-          (?P<message>.*)                     # finally, the rest of the error message
+          (?:\((?P<line>\d+),(?P<col>\d+)\))?
+          :\s*
+          (?P<message>.*)
         '''
         m = re.search(pattern, line, re.VERBOSE)
 
         if m and len(m.groups()) == 4:
             full_path =  m.group('full_path')
+            if full_path.startswith('\\\\'):  # UNC WSL path from Windows tools
+                wsl_path = wsl_unc_to_wsl_path(full_path)
+            else:  # normal C:\ path
+                wsl_path = str(windows_to_wsl(PureWindowsPath(full_path)).resolve())
+
             line_num = m.group('line')
             col_num = m.group('col')
             msg = format_message(m.group('message'))
-
-            wsl_path = windows_to_wsl(PureWindowsPath(full_path)).resolve()
 
             if line_num and col_num:
                 wsl_parsed = f"{wsl_path}:{line_num}:{col_num}"
@@ -157,6 +204,14 @@ def process_output(p: subprocess.Popen):
             continue
 
         print(format_message(output), end='')
+
+def collect_warning_code(line: str, warning_codes: set):
+    if warning_codes is None:
+        return
+
+    m = re.search(r'\bwarning\s+([A-Z]+[0-9]+)\b', line, re.IGNORECASE)
+    if m:
+        warning_codes.add(m.group(1).upper())
 
 def format_message(msg: str) -> str:
     if "Build succeeded." in msg:
@@ -222,7 +277,32 @@ def get_warnignore(project_file: Path) -> list:
                     warnings.append(stripped)
     return warnings
 
-def get_build_output(project_file: Path, default_output: str = r"bin\Debug") -> PureWindowsPath:
+def write_warnignore(project_file: Path, warning_codes: set):
+    warnignore_file = project_file.parent / ".warnignore"
+    existing_comments = []
+    existing_warnings = set()
+
+    if warnignore_file.exists():
+        with warnignore_file.open() as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    existing_comments.append(line.rstrip("\n"))
+                else:
+                    existing_warnings.add(stripped.upper())
+
+    warnings = sorted(existing_warnings | warning_codes)
+    lines = []
+    lines.extend(existing_comments)
+
+    if lines and warnings and lines[-1] != "":
+        lines.append("")
+
+    lines.extend(warnings)
+    warnignore_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Wrote {warnignore_file} with {len(warnings)} warning code(s).")
+
+def get_build_output(project_file: Path) -> PureWindowsPath:
     buildoutput_file = project_file.parent / ".buildoutput"
     if buildoutput_file.exists():
         with buildoutput_file.open() as f:
@@ -230,7 +310,128 @@ def get_build_output(project_file: Path, default_output: str = r"bin\Debug") -> 
                 stripped = line.strip()
                 if stripped and not stripped.startswith("#"):
                     return PureWindowsPath(stripped)
-    return PureWindowsPath(default_output)
+    return None
+
+def get_pathmap(project_file: Path) -> str:
+    pathmap = os.getenv("WSL_PROXY_PATHMAP")
+    if pathmap and pathmap.strip():
+        return format_pathmap(pathmap.strip())
+
+    pathmap_file = project_file.parent / ".pathmap"
+    entries = []
+
+    if pathmap_file.exists():
+        with pathmap_file.open() as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    entries.append(stripped)
+
+    if entries:
+        return format_pathmap(",".join(entries))
+
+    return None
+
+def format_pathmap(pathmap: str) -> str:
+    if pathmap.startswith("PathMap="):
+        return pathmap
+
+    return f"PathMap={pathmap}"
+
+def get_command_path(env_name: str, default: str = None) -> str:
+    command_path = os.getenv(env_name)
+    if command_path is None:
+        command_path = default
+
+    if command_path is None:
+        return None
+
+    command_path = command_path.strip()
+    if not command_path:
+        return None
+
+    return command_path.strip('"').strip("'")
+
+def get_windows_build_paths() -> tuple:
+    # These are evaluated from a props file so each project reference gets its own folder.
+    project_name = "$(MSBuildProjectName)"
+    obj_path = f"{WINDOWS_BUILD_ROOT}/obj/{project_name}/"
+    bin_path = f"{WINDOWS_BUILD_ROOT}/bin/{project_name}/"
+    return obj_path, bin_path
+
+def format_windows_output_path(output: PureWindowsPath) -> str:
+    output_path = str(output)
+    if output_path.endswith("\\") or output_path.endswith("/"):
+        return output_path
+    return output_path + "\\"
+
+def get_run_output_path(
+    project_file: Path,
+    output: PureWindowsPath,
+    config: str,
+    platform: str,
+    framework_ver: str,
+) -> Path:
+    if output:
+        return windows_output_to_wsl_path(output)
+
+    run_path = windows_to_wsl(PureWindowsPath(
+        f"{WINDOWS_BUILD_ROOT}/bin/{project_file.stem}/"
+    ))
+
+    if platform and platform.lower() not in ["anycpu", "any cpu"]:
+        run_path = run_path / platform
+
+    run_path = run_path / config
+
+    if framework_ver:
+        run_path = run_path / framework_ver
+
+    return run_path
+
+def windows_output_to_wsl_path(output: PureWindowsPath) -> Path:
+    if output.drive and output.drive.endswith(":"):
+        return windows_to_wsl(output)
+
+    return Path(output.as_posix())
+
+def write_windows_build_props(obj_path: str, bin_path: str) -> str:
+    props_path = f"{WINDOWS_BUILD_ROOT}/wslproxybuild.BuildPaths.props"
+    props_wsl_path = windows_to_wsl(PureWindowsPath(props_path))
+    props_wsl_path.parent.mkdir(parents=True, exist_ok=True)
+    props_wsl_path.write_text(
+        "\n".join([
+            "<Project>",
+            "  <PropertyGroup>",
+            f"    <BaseIntermediateOutputPath>{obj_path}</BaseIntermediateOutputPath>",
+            f"    <BaseOutputPath>{bin_path}</BaseOutputPath>",
+            "    <DefaultItemExcludes>$(DefaultItemExcludes);$(MSBuildProjectDirectory)\\obj\\**;$(MSBuildProjectDirectory)\\bin\\**</DefaultItemExcludes>",
+            "  </PropertyGroup>",
+            "</Project>",
+            ""
+        ]),
+        encoding="utf-8"
+    )
+    return props_path
+
+def write_windows_build_targets() -> str:
+    targets_path = f"{WINDOWS_BUILD_ROOT}/wslproxybuild.BuildPaths.targets"
+    targets_wsl_path = windows_to_wsl(PureWindowsPath(targets_path))
+    targets_wsl_path.parent.mkdir(parents=True, exist_ok=True)
+    targets_wsl_path.write_text(
+        "\n".join([
+            "<Project>",
+            "  <PropertyGroup>",
+            "    <_WslProxyBuildPlatformOutputPath Condition=\"'$(PlatformName)' != '' and '$(PlatformName)' != 'AnyCPU'\">$(PlatformName)\\</_WslProxyBuildPlatformOutputPath>",
+            "    <OutputPath>$(BaseOutputPath)$(_WslProxyBuildPlatformOutputPath)$(Configuration)\\</OutputPath>",
+            "    <OutputPath Condition=\"'$(TargetFramework)' != ''\">$(OutputPath)$(TargetFramework)\\</OutputPath>",
+            "  </PropertyGroup>",
+            "</Project>",
+            ""
+        ]),
+        encoding="utf-8"
+    )
+    return targets_path
 
 def get_run_args(project_file: Path) -> list:
     runargs_file = project_file.parent / ".runargs"
@@ -256,6 +457,8 @@ def run_executable(exe_path: str, args: [str]):
         print("Executable not found.")
         sys.exit(1)
 
+    ensure_executable(exe_path)
+
     try:
         cmd = [exe_path] + (args if args else [])
         p = subprocess.Popen(
@@ -279,12 +482,18 @@ def run_executable(exe_path: str, args: [str]):
 
 
 def find_executable(search_path: Path, project: Path) -> Path:
-    exe = search_path.glob(f"{project.stem}.exe")
-    result = next(exe, None)
-    if result and result.is_file():
-        return result
-    else:
+    direct_path = search_path / f"{project.stem}.exe"
+    if direct_path.is_file():
+        return direct_path
+
+    if not search_path.exists():
         return None
+
+    for p in sorted(search_path.rglob(f"{project.stem}.exe")):
+        if p.is_file():
+            return p
+
+    return None
 
 def C(k: str) -> str:
 
@@ -307,6 +516,22 @@ def project_uses_com(project_file: Path) -> bool:
         return True
 
     return False
+
+def ensure_executable(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    if os.access(path, os.X_OK):
+        return
+
+    try:
+        mode = path.stat().st_mode
+        path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        print(f"Added execute permission to {path}")
+    except Exception as e:
+        raise RuntimeError(
+            f"{path} is not executable and permissions could not be updated: {e}"
+        )
 
 if __name__ == "__main__":
     sys.exit(main())
