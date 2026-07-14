@@ -10,7 +10,8 @@ from pathlib import Path, PureWindowsPath
 from signal import signal, SIGINT
 
 DEFAULT_DOTNET = "/mnt/c/Program Files/dotnet/dotnet.exe"
-WINDOWS_BUILD_ROOT = os.getenv("WSL_PROXY_BUILD_ROOT", "C:/Temp/wslproxybuild")
+DEFAULT_WINDOWS_BUILD_ROOT = "C:/Temp/wslproxybuild"
+WINDOWS_BUILD_ROOT = os.getenv("WSL_PROXY_BUILD_ROOT", DEFAULT_WINDOWS_BUILD_ROOT)
 NO_INCREMENTAL_BUILD = False
 GENERATE_WARNIGNORE = False
 
@@ -57,14 +58,15 @@ def main():
 
     cc_hint = ""
 
-    vstools = os.getenv('VSTOOLSPATH')
+    vstools = to_windows_path(os.getenv('VSTOOLSPATH'))
 
     uses_com = project_uses_com(project_file)
     obj_path, bin_path = get_windows_build_paths()
     build_props_path = write_windows_build_props(obj_path, bin_path)
     build_targets_path = write_windows_build_targets()
 
-    print(f"********** Project references COM assemblies **********")
+    if uses_com:
+        print(f"********** Project references COM assemblies **********")
 
     pathmap = get_pathmap(project_file)
 
@@ -93,7 +95,7 @@ def main():
             cmd.append(nowarn)
         if output:
             cmd.append(f"-p:OutputPath={format_windows_output_path(output)}")
-        if vstools != None:
+        if vstools is not None:
             cmd.append(f"-p:VSToolsPath={vstools}")
         if pathmap:
             cmd.append(f"-p:{pathmap}")
@@ -117,7 +119,7 @@ def main():
             cmd.append(nowarn)
         if output:
             cmd.append(f"/p:OutputPath={format_windows_output_path(output)}")
-        if vstools != None:
+        if vstools is not None:
             cmd.append(f"/p:VSToolsPath={vstools}")
         if pathmap:
             cmd.append(f"/p:{pathmap}")
@@ -309,7 +311,7 @@ def get_build_output(project_file: Path) -> PureWindowsPath:
             for line in f:
                 stripped = line.strip()
                 if stripped and not stripped.startswith("#"):
-                    return PureWindowsPath(stripped)
+                    return PureWindowsPath(to_windows_path(stripped))
     return None
 
 def get_pathmap(project_file: Path) -> str:
@@ -352,11 +354,36 @@ def get_command_path(env_name: str, default: str = None) -> str:
 
     return command_path.strip('"').strip("'")
 
+def to_windows_path(path: str) -> str:
+    if path is None:
+        return None
+
+    path = path.strip().strip('"').strip("'")
+    if not path:
+        return None
+
+    if is_windows_path(path) or not path.startswith("/"):
+        return str(PureWindowsPath(path))
+
+    converted = subprocess.check_output(
+        ["wslpath", "-w", path],
+        encoding="utf-8",
+        errors="replace"
+    ).strip()
+    return str(PureWindowsPath(converted))
+
+def is_windows_path(path: str) -> bool:
+    return bool(re.match(r"^[A-Za-z]:[\\/]", path)) or path.startswith("\\\\")
+
+def get_windows_build_root() -> PureWindowsPath:
+    return PureWindowsPath(to_windows_path(WINDOWS_BUILD_ROOT))
+
 def get_windows_build_paths() -> tuple:
     # These are evaluated from a props file so each project reference gets its own folder.
     project_name = "$(MSBuildProjectName)"
-    obj_path = f"{WINDOWS_BUILD_ROOT}/obj/{project_name}/"
-    bin_path = f"{WINDOWS_BUILD_ROOT}/bin/{project_name}/"
+    build_root = get_windows_build_root()
+    obj_path = format_windows_output_path(build_root / "obj" / project_name)
+    bin_path = format_windows_output_path(build_root / "bin" / project_name)
     return obj_path, bin_path
 
 def format_windows_output_path(output: PureWindowsPath) -> str:
@@ -375,9 +402,7 @@ def get_run_output_path(
     if output:
         return windows_output_to_wsl_path(output)
 
-    run_path = windows_to_wsl(PureWindowsPath(
-        f"{WINDOWS_BUILD_ROOT}/bin/{project_file.stem}/"
-    ))
+    run_path = windows_to_wsl(get_windows_build_root() / "bin" / project_file.stem)
 
     if platform and platform.lower() not in ["anycpu", "any cpu"]:
         run_path = run_path / platform
@@ -396,8 +421,8 @@ def windows_output_to_wsl_path(output: PureWindowsPath) -> Path:
     return Path(output.as_posix())
 
 def write_windows_build_props(obj_path: str, bin_path: str) -> str:
-    props_path = f"{WINDOWS_BUILD_ROOT}/wslproxybuild.BuildPaths.props"
-    props_wsl_path = windows_to_wsl(PureWindowsPath(props_path))
+    props_path = get_windows_build_root() / "wslproxybuild.BuildPaths.props"
+    props_wsl_path = windows_to_wsl(props_path)
     props_wsl_path.parent.mkdir(parents=True, exist_ok=True)
     props_wsl_path.write_text(
         "\n".join([
@@ -412,11 +437,11 @@ def write_windows_build_props(obj_path: str, bin_path: str) -> str:
         ]),
         encoding="utf-8"
     )
-    return props_path
+    return str(props_path)
 
 def write_windows_build_targets() -> str:
-    targets_path = f"{WINDOWS_BUILD_ROOT}/wslproxybuild.BuildPaths.targets"
-    targets_wsl_path = windows_to_wsl(PureWindowsPath(targets_path))
+    targets_path = get_windows_build_root() / "wslproxybuild.BuildPaths.targets"
+    targets_wsl_path = windows_to_wsl(targets_path)
     targets_wsl_path.parent.mkdir(parents=True, exist_ok=True)
     targets_wsl_path.write_text(
         "\n".join([
@@ -431,7 +456,7 @@ def write_windows_build_targets() -> str:
         ]),
         encoding="utf-8"
     )
-    return targets_path
+    return str(targets_path)
 
 def get_run_args(project_file: Path) -> list:
     runargs_file = project_file.parent / ".runargs"
