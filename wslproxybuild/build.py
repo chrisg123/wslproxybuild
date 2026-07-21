@@ -10,6 +10,7 @@ from pathlib import Path, PureWindowsPath
 from signal import signal, SIGINT
 
 DEFAULT_DOTNET = "/mnt/c/Program Files/dotnet/dotnet.exe"
+DEFAULT_NUNIT = "/mnt/c/ProgramData/chocolatey/lib/nunit-console-runner/tools/nunit3-console.exe"
 DEFAULT_WINDOWS_BUILD_ROOT = "C:/Temp/wslproxybuild"
 WINDOWS_BUILD_ROOT = os.getenv("WSL_PROXY_BUILD_ROOT", DEFAULT_WINDOWS_BUILD_ROOT)
 NO_INCREMENTAL_BUILD = False
@@ -44,6 +45,10 @@ def main():
         nowarn = "-noWarn:" + str.join(',', warnings_list)
 
     output = get_build_output(project_file)
+
+    if args.test:
+        test_output = get_run_output_path(project_file, output, args.config, args.platform, framework_ver)
+        return run_tests(project_file, test_output, framework_ver, args)
 
     if args.run:
         run_args_from_file = get_run_args(project_file)
@@ -233,6 +238,376 @@ def format_message(msg: str) -> str:
     formatted_msg = windows_path_pattern.sub(replace_with_wsl, formatted_msg)
     return formatted_msg
 
+def run_tests(
+    project_file: Path,
+    test_output: Path,
+    framework_ver: str,
+    args: argparse.Namespace,
+) -> int:
+    runner = get_test_runner(project_file, args)
+
+    if runner == "nunit":
+        return run_nunit_tests(project_file, test_output, args)
+
+    return run_dotnet_tests(project_file, framework_ver, args)
+
+def get_test_runner(project_file: Path, args: argparse.Namespace) -> str:
+    if args.test_runner != "auto":
+        return args.test_runner
+
+    if project_supports_dotnet_test(project_file):
+        return "dotnet"
+
+    if project_uses_nunit(project_file):
+        return "nunit"
+
+    return "dotnet"
+
+def run_dotnet_tests(
+    project_file: Path,
+    framework_ver: str,
+    args: argparse.Namespace,
+) -> int:
+    dotnet = get_command_path('DOTNET', DEFAULT_DOTNET)
+    if dotnet is None:
+        sys.stderr.write("No dotnet command. Ensure environment variable DOTNET is set in WSL.\n")
+        return 1
+
+    obj_path, bin_path = get_windows_build_paths()
+    build_props_path = write_windows_build_props(obj_path, bin_path)
+    build_targets_path = write_windows_build_targets()
+    output = get_build_output(project_file)
+    vstools = to_windows_path(os.getenv('VSTOOLSPATH'))
+    pathmap = get_pathmap(project_file)
+
+    cmd = [
+        dotnet,
+        "test",
+        project_file.name,
+        "--no-build",
+        "--verbosity",
+        args.verbosity,
+        "--configuration",
+        args.config,
+        f"-p:Platform={args.platform}",
+        f"-p:DirectoryBuildPropsPath={build_props_path}",
+        f"-p:CustomBeforeMicrosoftCommonTargets={build_targets_path}",
+    ]
+
+    if framework_ver:
+        cmd.extend(["--framework", framework_ver])
+    if output:
+        cmd.append(f"-p:OutputPath={format_windows_output_path(output)}")
+    if vstools is not None:
+        cmd.append(f"-p:VSToolsPath={vstools}")
+    if pathmap:
+        cmd.append(f"-p:{pathmap}")
+    if args.test_filter:
+        cmd.extend(["--filter", f"FullyQualifiedName~{args.test_filter}"])
+
+    print("Running tests with dotnet test...")
+    print(subprocess.list2cmdline(cmd))
+
+    return run_test_process(cmd, project_file.parent, "dotnet")
+
+def run_nunit_tests(
+    project_file: Path,
+    test_output: Path,
+    args: argparse.Namespace,
+) -> int:
+    nunit = get_command_path("NUNIT", DEFAULT_NUNIT)
+    if not command_path_exists(nunit):
+        sys.stderr.write(f"NUnit console runner not found: {nunit}\n")
+        sys.stderr.write("Set NUNIT to the nunit3-console.exe path.\n")
+        return 1
+
+    assembly = find_assembly(test_output, project_file)
+    if assembly is None:
+        sys.stderr.write(f"Test assembly not found in: {test_output}\n")
+        sys.stderr.write("Build the project first, then run build.py --test again.\n")
+        return 1
+
+    cmd = [
+        nunit,
+        "--encoding=utf-8",
+        to_windows_tool_path(assembly),
+    ]
+
+    if args.test_filter:
+        cmd.append(f"--test={args.test_filter}")
+
+    print("Running tests with NUnit...")
+    print(subprocess.list2cmdline(cmd))
+
+    return run_test_process(cmd, project_file.parent, "nunit")
+
+def run_test_process(cmd: list, working_directory: Path, formatter: str) -> int:
+    p = subprocess.Popen(
+        cmd,
+        cwd=working_directory,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        shell=False,
+        encoding='utf-8',
+        errors='replace')
+
+    state = {}
+    while True:
+        output = p.stdout.readline()
+        if output == '' and p.poll() is not None:
+            break
+
+        sys.stdout.flush()
+        line = output.rstrip()
+
+        stack_lines = format_test_stack_trace_line(line)
+        if stack_lines:
+            for stack_line in stack_lines:
+                print(stack_line)
+            continue
+
+        stripped = line.strip()
+        if formatter == "dotnet":
+            print(format_dotnet_test_line(stripped))
+        elif formatter == "nunit":
+            print(format_nunit_line(stripped, state))
+        else:
+            print(stripped)
+
+    p.stdout.close()
+    return p.wait()
+
+def format_test_stack_trace_line(line: str) -> list:
+    m = re.search(r'( +at.*in )(C:\\[^:]+):line ([0-9]+)', line)
+    if not m or len(m.groups()) != 3:
+        return None
+
+    begin = m.groups()[0]
+    filename = m.groups()[1]
+    linenum = int(m.groups()[2])
+    drive, rest = filename.split(':', 1)
+    filename = '/mnt/' + drive.lower() + rest.replace('\\', '/')
+    compmodepath = f"{filename}:{linenum}:"
+    return [begin, compmodepath]
+
+def format_dotnet_test_line(line: str) -> str:
+    summary = format_dotnet_summary_line(line)
+    if summary:
+        return summary
+
+    m = re.match(r'(\s*Failed|\s*Passed)?\s*(\w+)\s*\[(\d+ ms)\]', line)
+    if not m:
+        return line
+
+    status, test_name, duration = m.groups()
+    status_text = status.strip() if status else ""
+    color_status = f"{C('boldred')}{status_text}{C('endc')}" \
+        if status_text == "Failed" else f"{C('green')}{status_text}{C('endc')}"
+    color_test_name = f"{C('cyan')}{test_name}{C('endc')}"
+    return f"{color_status} {color_test_name} [{duration}]"
+
+def format_dotnet_summary_line(line: str) -> str:
+    m = re.match(r'^(Passed!|Failed!)\s+-\s+(.+?)\s+-\s+(.+)$', line)
+    if not m:
+        return None
+
+    result, stats_text, assembly = m.groups()
+    pairs = re.findall(r'([^:,]+):\s*([^,]+)', stats_text)
+    stats = {key.strip(): value.strip() for key, value in pairs}
+
+    ordered_names = [
+        "Total",
+        "Passed",
+        "Failed",
+        "Skipped",
+        "Warnings",
+        "Inconclusive",
+        "Duration",
+    ]
+
+    names = [name for name in ordered_names if name in stats]
+    names.extend(name for name in stats if name not in names)
+
+    color = C('green') if result == "Passed!" else C('boldred')
+    formatted_stats = [
+        format_test_summary_value(name, stats[name])
+        for name in names
+    ]
+
+    return f"{color}{result}{C('endc')}  " + \
+        str.join(", ", formatted_stats) + \
+        f"  {assembly.strip()}"
+
+def format_nunit_line(line: str, state: dict) -> str:
+    if line in [
+            "Runtime Environment",
+            "Test Files",
+            "Run Settings",
+            "Test Run Summary",
+            "Errors, Failures and Warnings"]:
+        if line == "Test Run Summary":
+            state["in_nunit_summary"] = True
+        return f"{C('cyan')}{line}{C('endc')}"
+
+    if re.match(r'^\d+\) Failed :', line):
+        return f"{C('boldred')}{line}{C('endc')}"
+
+    if state.get("in_nunit_summary"):
+        if line == "Overall result: Passed":
+            return f"{C('green')}{line}{C('endc')}"
+
+        if line == "Overall result: Failed":
+            return f"{C('boldred')}{line}{C('endc')}"
+
+        if line.startswith("Test Count"):
+            return format_nunit_count_line(line)
+
+        if line.startswith("Duration"):
+            return f"{C('blue')}{line}{C('endc')}"
+
+    return line
+
+def format_nunit_count_line(line: str) -> str:
+    formatted = []
+    for part in line.split(","):
+        if ":" not in part:
+            formatted.append(part.strip())
+            continue
+
+        name, value = part.split(":", 1)
+        formatted.append(format_test_summary_value(name.strip(), value.strip()))
+
+    return str.join(", ", formatted)
+
+def format_test_summary_value(name: str, value: str) -> str:
+    text = f"{name}: {value}"
+    n = get_summary_number(value)
+
+    if name in ["Total", "Test Count"] and n > 0:
+        return f"{C('cyan')}{text}{C('endc')}"
+
+    if name == "Passed" and n > 0:
+        return f"{C('green')}{text}{C('endc')}"
+
+    if name == "Failed" and n > 0:
+        return f"{C('boldred')}{text}{C('endc')}"
+
+    if name == "Warnings" and n > 0:
+        return f"{C('yellow')}{text}{C('endc')}"
+
+    if name == "Inconclusive" and n > 0:
+        return f"{C('cyan')}{text}{C('endc')}"
+
+    if name == "Skipped" and n > 0:
+        return f"{C('blue')}{text}{C('endc')}"
+
+    if name == "Duration":
+        return f"{C('blue')}{text}{C('endc')}"
+
+    return text
+
+def get_summary_number(value: str) -> int:
+    m = re.search(r'\d+', value)
+    if not m:
+        return 0
+
+    return int(m.group(0))
+
+def project_supports_dotnet_test(project_file: Path) -> bool:
+    return project_has_package(project_file, "Microsoft.NET.Test.Sdk")
+
+def project_uses_nunit(project_file: Path) -> bool:
+    return project_has_package(project_file, "NUnit") or \
+        "nunit.framework" in project_file.read_text(
+            encoding="utf-8-sig",
+            errors="replace").lower()
+
+def project_has_package(project_file: Path, package_name: str) -> bool:
+    package_name = package_name.lower()
+
+    tree = ET.parse(project_file.resolve())
+    root = tree.getroot()
+
+    for node in root.iter():
+        node_name = local_xml_name(node.tag)
+        if node_name not in ["PackageReference", "Reference"]:
+            continue
+
+        include = node.attrib.get("Include", "")
+        if package_name in include.lower():
+            return True
+
+    packages_file = project_file.parent / "packages.config"
+    if not packages_file.exists():
+        return False
+
+    packages_root = ET.parse(packages_file.resolve()).getroot()
+    for node in packages_root.iter():
+        if local_xml_name(node.tag) != "package":
+            continue
+
+        package_id = node.attrib.get("id", "")
+        if package_name == package_id.lower():
+            return True
+
+    return False
+
+def local_xml_name(tag: str) -> str:
+    if "}" in tag:
+        return tag.rsplit("}", 1)[1]
+    return tag
+
+def get_assembly_name(project_file: Path) -> str:
+    tree = ET.parse(project_file.resolve())
+    root = tree.getroot()
+
+    for node in root.iter():
+        if local_xml_name(node.tag) == "AssemblyName" and node.text:
+            return node.text.strip()
+
+    return project_file.stem
+
+def find_assembly(search_path: Path, project: Path) -> Path:
+    assembly_name = get_assembly_name(project)
+    direct_path = search_path / f"{assembly_name}.dll"
+    if direct_path.is_file():
+        return direct_path
+
+    if not search_path.exists():
+        return None
+
+    for p in sorted(search_path.rglob(f"{assembly_name}.dll")):
+        if p.is_file():
+            return p
+
+    return None
+
+def command_path_exists(command_path: str) -> bool:
+    if command_path is None:
+        return False
+
+    if is_windows_path(command_path):
+        return windows_tool_path_exists(command_path)
+
+    if command_path.startswith("/"):
+        return Path(command_path).exists()
+
+    return True
+
+def windows_tool_path_exists(path: str) -> bool:
+    try:
+        converted = subprocess.check_output(
+            ["wslpath", "-u", path],
+            encoding="utf-8",
+            errors="replace"
+        ).strip()
+        return Path(converted).exists()
+    except subprocess.CalledProcessError:
+        return False
+
+def to_windows_tool_path(path: Path) -> str:
+    return str(PureWindowsPath(to_windows_path(str(path.resolve()))))
+
 
 def find_project_file() -> Path:
     for p in list(Path('.').glob('*')):
@@ -264,7 +639,20 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--config", default="Debug", help="Build configuration")
     parser.add_argument("--platform", default="AnyCPU", help="Target platform")
     parser.add_argument("--warn", default="2", help="Warning level")
-    parser.add_argument("-r", "--run", action="store_true", help="Run")
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument("-r", "--run", action="store_true", help="Run")
+    action_group.add_argument("-t", "--test", action="store_true", help="Run tests without building")
+    parser.add_argument(
+        "--test-runner",
+        choices=["auto", "dotnet", "nunit"],
+        default=os.getenv("TEST_RUNNER", "auto").lower(),
+        help="Test runner to use. Defaults to auto detection."
+    )
+    parser.add_argument(
+        "--test-filter",
+        default=os.getenv("TEST_NAME_FILTER", ""),
+        help="Optional test name filter"
+    )
     parser.add_argument("--run-args", nargs=argparse.REMAINDER, help="Run arguments")
     return parser.parse_args()
 
@@ -409,10 +797,16 @@ def get_run_output_path(
 
     run_path = run_path / config
 
-    if framework_ver:
+    if should_append_framework_to_output_path(framework_ver):
         run_path = run_path / framework_ver
 
     return run_path
+
+def should_append_framework_to_output_path(framework_ver: str) -> bool:
+    if not framework_ver:
+        return False
+
+    return not framework_ver.startswith("v")
 
 def windows_output_to_wsl_path(output: PureWindowsPath) -> Path:
     if output.drive and output.drive.endswith(":"):
