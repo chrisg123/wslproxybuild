@@ -80,7 +80,7 @@ def main():
         CC = get_command_path('DOTNET', DEFAULT_DOTNET)
         cmd = [
                 CC,
-                "build",
+                "restore" if args.restore else "build",
                 project_file.name,
                 "--verbosity",
                 args.verbosity,
@@ -117,6 +117,9 @@ def main():
                 f"/p:DirectoryBuildPropsPath={build_props_path}",
                 f"/p:CustomBeforeMicrosoftCommonTargets={build_targets_path}",
             ]
+
+        if args.restore:
+            cmd.append("/t:Restore")
 
         if NO_INCREMENTAL_BUILD:
             cmd.append("/t:Rebuild")
@@ -642,6 +645,7 @@ def get_args() -> argparse.Namespace:
     action_group = parser.add_mutually_exclusive_group()
     action_group.add_argument("-r", "--run", action="store_true", help="Run")
     action_group.add_argument("-t", "--test", action="store_true", help="Run tests without building")
+    action_group.add_argument("--restore", action="store_true", help="Restore NuGet packages without building")
     parser.add_argument(
         "--test-runner",
         choices=["auto", "dotnet", "nunit"],
