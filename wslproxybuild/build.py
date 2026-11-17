@@ -5,6 +5,7 @@ import re
 import os
 import subprocess
 import argparse
+import shlex
 import xml.etree.ElementTree as ET
 from pathlib import Path, PureWindowsPath
 from signal import signal, SIGINT
@@ -333,6 +334,7 @@ def run_nunit_tests(
     cmd = [
         nunit,
         "--encoding=utf-8",
+        "--labels=Before",
         to_windows_tool_path(assembly),
     ]
 
@@ -861,11 +863,9 @@ def get_run_args(project_file: Path) -> list:
     run_args = []
 
     if runargs_file.exists():
-        with runargs_file.open() as f:
+        with runargs_file.open(encoding="utf-8") as f:
             for line in f:
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#"):
-                    run_args.extend(stripped.split())
+                run_args.extend(shlex.split(line, comments=True))
 
     return run_args
 
